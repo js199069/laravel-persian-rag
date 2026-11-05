@@ -2,15 +2,16 @@
 
 namespace Js199069\PersianRag\Console;
 
-use Js199069\PersianRag\Search\HybridSearch;
 use Illuminate\Console\Command;
+use Js199069\PersianRag\Search\HybridSearch;
+use Js199069\PersianRag\Support\Manifest;
 
 class EvaluateSearch extends Command
 {
     protected $signature = 'rag:eval
         {--file=storage/app/eval.csv : فایل سؤال‌های ارزیابی}
         {--k=5 : تعداد نتیجه‌ی بررسی‌شده}
-        {--provider=ollama_local}';
+        {--provider= : provider برای embedding (پیش‌فرض از config)}';
 
     protected $description = 'ارزیابی جست‌وجو: پیدا کردن سند و صفحه‌ی درست، نشت دسترسی، و پیشنهاد آستانه‌ی «جواب نده»';
 
@@ -25,7 +26,14 @@ class EvaluateSearch extends Command
             return self::FAILURE;
         }
 
-        $search = new HybridSearch($this->option('provider'));
+        $search = new HybridSearch(
+            provider: $this->option('provider') ?: config('persian-rag.embedding.provider'),
+            candidates: (int) config('persian-rag.search.candidates'),
+            maxPerDocument: (int) config('persian-rag.search.max_per_document'),
+            maxTermShare: (float) config('persian-rag.search.max_term_share'),
+            rrfK: (int) config('persian-rag.search.rrf_k'),
+            questionWords: config('persian-rag.search.question_words'),
+        );
         $k = (int) $this->option('k');
 
         $table = [];
@@ -33,13 +41,13 @@ class EvaluateSearch extends Command
         $negativeSimilarities = [];
         $accessChecks = [];
 
-        foreach ($this->readCsv($path) as $row) {
+        foreach (Manifest::read($path) as $row) {
             $role = trim($row['role'] ?? '');
             $audiences = null;
             if ($role !== '') {
                 $audiences = config("persian-rag.roles.{$role}");
                 if ($audiences === null) {
-                    $this->error("سؤال {$row['id']}: نقش «{$role}» در config/rag.php تعریف نشده.");
+                    $this->error("سؤال {$row['id']}: نقش «{$role}» در config/persian-rag.php تعریف نشده.");
 
                     return self::FAILURE;
                 }
@@ -56,6 +64,7 @@ class EvaluateSearch extends Command
                 $ok = ! in_array($mustNotDoc, $docs, true);
                 $accessChecks[] = $ok;
                 $table[] = [$row['id'], 'access', $ok ? '✅' : '❌ نشت', '-', sprintf('%.3f', $best), $docs[0] ?? '-'];
+
                 continue;
             }
 
@@ -63,25 +72,25 @@ class EvaluateSearch extends Command
             if ($expectedDocs === []) {
                 $negativeSimilarities[] = $best;
                 $table[] = [$row['id'], 'negative', '-', '-', sprintf('%.3f', $best), $docs[0] ?? '-'];
+
                 continue;
             }
 
-            // سؤال جواب‌دار
-// سؤال جواب‌دار: بهترین رتبه در بین همه‌ی سندهای درست
-$ranks = array_filter(
-    array_map(fn ($d) => array_search($d, $docs, true), $expectedDocs),
-    fn ($r) => $r !== false,
-);
-$rank = $ranks === [] ? false : min($ranks);
-$page = (int) ($row['expected_page'] ?? 0);
-$pageHit = $page > 0 && collect($result['results'])->contains(
-    fn ($r) => in_array($r['chunk']->document->doc_key, $expectedDocs, true)
-        && $r['chunk']->page_from <= $page && $r['chunk']->page_to >= $page,
-);
+            // سؤال جواب‌دار: بهترین رتبه در بین همه‌ی سندهای درست
+            $ranks = array_filter(
+                array_map(fn ($d) => array_search($d, $docs, true), $expectedDocs),
+                fn ($r) => $r !== false,
+            );
+            $rank = $ranks === [] ? false : min($ranks);
+            $page = (int) ($row['expected_page'] ?? 0);
+            $pageHit = $page > 0 && collect($result['results'])->contains(
+                fn ($r) => in_array($r['chunk']->document->doc_key, $expectedDocs, true)
+                    && $r['chunk']->page_from <= $page && $r['chunk']->page_to >= $page,
+            );
 
-$answerable[] = ['rank' => $rank, 'page_hit' => $pageHit, 'has_page' => $page > 0, 'best' => $best];
-$label = $rank === false ? '❌' : '✅ @' . ($rank + 1);
-$table[] = [$row['id'], 'answer', $label, $page > 0 ? ($pageHit ? '✅' : '❌') : '-', sprintf('%.3f', $best), $docs[0] ?? '-'];
+            $answerable[] = ['rank' => $rank, 'page_hit' => $pageHit, 'has_page' => $page > 0, 'best' => $best];
+            $label = $rank === false ? '❌' : '✅ @' . ($rank + 1);
+            $table[] = [$row['id'], 'answer', $label, $page > 0 ? ($pageHit ? '✅' : '❌') : '-', sprintf('%.3f', $best), $docs[0] ?? '-'];
         }
 
         $this->table(['id', 'type', 'doc', 'page', 'best sim', 'top doc'], $table);
@@ -91,12 +100,15 @@ $table[] = [$row['id'], 'answer', $label, $page > 0 ? ($pageHit ? '✅' : '❌')
             $hit1 = count(array_filter($answerable, fn ($a) => $a['rank'] === 0));
             $hitK = count(array_filter($answerable, fn ($a) => $a['rank'] !== false));
             $withPage = array_filter($answerable, fn ($a) => $a['has_page']);
-$pages = count(array_filter($withPage, fn ($a) => $a['page_hit']));
+            $pageHits = count(array_filter($withPage, fn ($a) => $a['page_hit']));
             $mrr = array_sum(array_map(fn ($a) => $a['rank'] === false ? 0 : 1 / ($a['rank'] + 1), $answerable)) / $n;
 
+            // معیار صفحه فقط وقتی معنا دارد که حداقل یک سؤال صفحه‌ی مورد انتظار داشته باشد
+            $pageText = $withPage === [] ? '-' : sprintf('%d%%', 100 * $pageHits / count($withPage));
+
             $this->info(sprintf(
-                'سؤال‌های جواب‌دار (%d): سند درست در رتبه‌ی ۱: %d%% | در %d نتیجه‌ی اول: %d%% | صفحه‌ی درست: %d%% | MRR: %.2f',
-                $n, 100 * $hit1 / $n, $k, 100 * $hitK / $n, count($withPage) ? 100 * $pages / count($withPage) : 0, $mrr,
+                'سؤال‌های جواب‌دار (%d): سند درست در رتبه‌ی ۱: %d%% | در %d نتیجه‌ی اول: %d%% | صفحه‌ی درست: %s | MRR: %.2f',
+                $n, 100 * $hit1 / $n, $k, 100 * $hitK / $n, $pageText, $mrr,
             ));
         }
 
@@ -114,6 +126,16 @@ $pages = count(array_filter($withPage, fn ($a) => $a['page_hit']));
 
     private function thresholdSweep(array $positive, array $negative): void
     {
+        $current = (float) config('persian-rag.min_similarity');
+
+        if ($positive !== []) {
+            $refusedNow = count(array_filter($positive, fn ($s) => $s < $current));
+            $this->info(sprintf(
+                'آستانه‌ی فعلی (min_similarity): %.2f — با این مقدار، %d سؤال جواب‌دار در جست‌وجو رد می‌شود.',
+                $current, $refusedNow,
+            ));
+        }
+
         if ($positive === [] || $negative === []) {
             $this->warn('برای پیشنهاد آستانه، هم سؤال جواب‌دارِ پیدا‌شده لازم است و هم سؤال بی‌جواب.');
 
@@ -137,23 +159,6 @@ $pages = count(array_filter($withPage, fn ($a) => $a['page_hit']));
 
         $this->table(['threshold', 'false refusals', 'false answers', 'correct'], $rows);
         $this->info(sprintf('بهترین آستانه روی این داده: %.2f (%d از %d درست)', $best[0], $best[1], $total));
-    }
-
-    private function readCsv(string $path): array
-    {
-        $content = preg_replace('/^\xEF\xBB\xBF/', '', file_get_contents($path));
-        $lines = preg_split('/\r\n|\n|\r/', trim($content));
-        $header = array_map('trim', str_getcsv(array_shift($lines), ',', '"', ''));
-
-        $rows = [];
-        foreach ($lines as $line) {
-            if (trim($line) === '') {
-                continue;
-            }
-            $values = array_slice(array_pad(str_getcsv($line, ',', '"', ''), count($header), ''), 0, count($header));
-            $rows[] = array_combine($header, $values);
-        }
-
-        return $rows;
+        $this->line('<comment>لایه‌ی ۱ فقط برای سؤال‌های کاملاً بی‌ربط است؛ «false answers» اینجا به مدل می‌رسند، که دفاع اصلی است. آستانه را طوری بگذار که «false refusals» صفر باشد.</comment>');
     }
 }
