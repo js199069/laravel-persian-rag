@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased] — 0.1.0
+## [0.1.0] — 2026-11-05
 
 ### Added
 - Text and OCR extraction for Persian PDF/DOCX, with per-page best-method selection and conservative OCR noise cleanup.
